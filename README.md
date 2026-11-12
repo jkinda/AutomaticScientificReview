@@ -97,6 +97,61 @@ For a first, cheaper trial run use `--papers 10 --max-iterations 30`.
 This is a drafting and search aid. Results still need checking by someone who knows the
 field before they are published.
 
+## Hosted version (Claude Managed Agents)
+
+The same review can run on Anthropic's infrastructure instead of your machine. Anthropic
+runs the agent loop and a sandbox. This repository is mounted in the sandbox, and the
+agent calls the same tools from its shell (`python -m scireview.tools ...`). You can close
+your laptop while it works and come back to the results.
+
+What the hosted version does differently:
+
+- **Parallel reading.** When many papers need reading, the agent starts a *workflow
+  run*: one sub-agent reads and extracts each paper, then a second agent checks every
+  paper's numbers against the full text. Every sub-agent uses tokens, so each session
+  has a hard spending cap (`--budget-usd`, default 30). To turn parallel reading off, set
+  `workflows: {type: disabled}` in `agents/scientific-reviewer.md` and run `ant apply` again.
+- **Graded until it passes.** The task is sent with a rubric (`RUBRIC` in
+  `scireview/hosted.py`). A separate grader checks the review against it and sends it
+  back for revision, up to `--max-revisions` times.
+- **Restricted network.** The sandbox can reach PyPI, the four databases and a list of
+  open-access hosts (`environments/scireview.yaml`). PDFs hosted anywhere else fall back
+  to the abstract.
+
+Managed Agents is in beta.
+
+**One-time setup.** Install the [`ant` CLI](https://github.com/anthropics/anthropic-cli)
+(1.30 or later) and log in with `ant auth login`. Then, from the repository root:
+
+```bash
+ant apply --dry-run -v agents/scientific-reviewer.md environments/scireview.yaml
+```
+
+```bash
+ant apply agents/scientific-reviewer.md environments/scireview.yaml
+```
+
+This creates the agent and its environment and writes their IDs to `claude-lock.json`;
+commit that file. After editing either file, run `ant apply` again to update them.
+
+**Run a review.** You need a GitHub token that can read this repository (fine-grained,
+*Contents: Read*). It is used to clone the repository and never enters the sandbox.
+
+```bash
+export GITHUB_TOKEN=github_pat_...
+```
+
+```bash
+scireview-hosted "Caractérisation des propriétés hydriques des sols latéritiques utilisés en construction" \
+  --language French --criteria "Experimental studies on water retention, permeability or capillarity of lateritic soils" \
+  --papers 25 --budget-usd 30
+```
+
+The script prints a Console link where you can watch the session live, streams
+progress, and saves the outputs to `reviews/<date>-<topic>-hosted/`. If the connection
+drops or the budget is reached, re-attach with `--session <session id>`. Use `--branch` to
+mount a branch other than `main`.
+
 ## Development
 
 ```bash

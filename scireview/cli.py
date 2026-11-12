@@ -13,8 +13,8 @@ from pathlib import Path
 import anthropic
 
 from .agent import MODEL, ReviewConfig, finalize, run_research, run_synthesis
-from .http import HttpClient
 from .library import Library
+from .toolbox import ToolBox
 
 
 def slugify(text: str, max_len: int = 60) -> str:
@@ -54,8 +54,7 @@ def main(argv: list[str] | None = None) -> int:
                        effort=args.effort)
 
     if (args.resume or args.synthesis_only) and (out / "state.json").exists():
-        lib = Library.load(out)
-        print(f"Resuming {out} — {lib.counts()}")
+        print(f"Resuming {out} — {Library.load(out).counts()}")
     elif args.resume or args.synthesis_only:
         print(f"No state.json in {out} to resume from.", file=sys.stderr)
         return 2
@@ -63,9 +62,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{out} already holds a review. Use --resume, or choose another --out.",
               file=sys.stderr)
         return 2
-    else:
-        lib = Library(out, topic=args.topic)
-        lib.save()
+    box = ToolBox(out, topic=args.topic, year_from=args.year_from, year_to=args.year_to)
 
     client = anthropic.Anthropic()
     summary_path = out / "research_summary.md"
@@ -74,9 +71,10 @@ def main(argv: list[str] | None = None) -> int:
             summary = summary_path.read_text(encoding="utf-8") if summary_path.exists() else ""
         else:
             print(f"Phase 1 — research ({cfg.model}, effort {cfg.effort}) → {out}")
-            summary = run_research(client, cfg, lib, HttpClient())
+            summary = run_research(client, cfg, box)
             summary_path.write_text(summary, encoding="utf-8")
 
+        lib = Library.load(out)
         if not lib.with_status("included"):
             print("No papers were included, so there is nothing to synthesise.", file=sys.stderr)
             return 1

@@ -36,6 +36,7 @@ class Library:
         self.entries: dict[str, Entry] = {}
         self._by_identity: dict[str, str] = {}
         self.searches: list[dict[str, Any]] = []
+        self.settings: dict[str, Any] = {}  # e.g. criteria, year window, language
 
     # ------------------------------------------------------------------ papers
     def add(self, paper: Paper) -> tuple[str, bool]:
@@ -84,10 +85,13 @@ class Library:
         entry.status, entry.reason = decision, reason
         self.save()
 
-    def add_evidence(self, key: str, evidence: dict[str, Any]) -> None:
+    def add_evidence(self, key: str, evidence: dict[str, Any], replace: bool = False) -> None:
+        """Add an evidence record; with ``replace``, it supersedes the earlier ones."""
         entry = self.get(key)
         if entry.status != "included":
             raise ValueError(f"{key} is not included; screen it as included first.")
+        if replace:
+            entry.evidence = []
         entry.evidence.append(evidence)
         self.save()
 
@@ -108,6 +112,7 @@ class Library:
         self.out_dir.mkdir(parents=True, exist_ok=True)
         data = {
             "topic": self.topic,
+            "settings": self.settings,
             "searches": self.searches,
             "entries": [{"paper": e.paper.to_dict(), "status": e.status, "reason": e.reason,
                          "evidence": e.evidence, "fulltext_note": e.fulltext_note}
@@ -123,6 +128,7 @@ class Library:
         data = json.loads(lib.state_path.read_text(encoding="utf-8"))
         lib.topic = data.get("topic", "")
         lib.searches = data.get("searches", [])
+        lib.settings = data.get("settings", {})
         for raw in data.get("entries", []):
             paper = Paper.from_dict(raw["paper"])
             lib.entries[paper.key] = Entry(paper=paper, status=raw["status"],

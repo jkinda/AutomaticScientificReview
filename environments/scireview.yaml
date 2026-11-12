@@ -1,0 +1,47 @@
+# Sandbox for the hosted Scientific Reviewer agent (Claude Managed Agents).
+# Sync with:  ant apply agents/scientific-reviewer.md environments/scireview.yaml
+name: scireview
+description: Sandbox for automated literature reviews with the scireview package.
+config:
+  type: cloud
+  networking:
+    # Deny by default. The agent reaches PyPI (to install scireview), the four
+    # literature databases, and common open-access hosts for full-text PDFs.
+    # A PDF on a host not listed here fails cleanly and the agent falls back to
+    # the abstract. To let it fetch PDFs from any publisher, switch to
+    # `type: unrestricted` - that gives the whole sandbox full internet access.
+    type: limited
+    allow_package_managers: true
+    allow_mcp_servers: false
+    allowed_hosts:
+      # Literature databases
+      - api.openalex.org
+      - api.semanticscholar.org
+      - api.crossref.org
+      - export.arxiv.org
+      - arxiv.org
+      - doi.org
+      # Open-access repositories and publishers
+      - hal.science
+      - "*.hal.science"
+      - "*.archives-ouvertes.fr"
+      - zenodo.org
+      - core.ac.uk
+      - "*.core.ac.uk"
+      - europepmc.org
+      - pmc.ncbi.nlm.nih.gov
+      - www.ncbi.nlm.nih.gov
+      - doaj.org
+      - www.mdpi.com
+      - mdpi-res.com
+      - "*.mdpi-res.com"
+      - www.frontiersin.org
+      - journals.plos.org
+      - "*.springeropen.com"
+      - www.e3s-conferences.org
+      - www.matec-conferences.org
+      - iopscience.iop.org
+      - www.scielo.br
+      - "*.scielo.org"
+      - www.redalyc.org
+      - downloads.hindawi.com

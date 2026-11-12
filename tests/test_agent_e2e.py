@@ -13,6 +13,7 @@ from scireview import agent, sources
 from scireview.agent import ReviewConfig, finalize, run_research, run_synthesis
 from scireview.library import Library
 from scireview.models import Paper
+from scireview.toolbox import ToolBox
 
 
 def msg(content, stop_reason):
@@ -60,7 +61,6 @@ def test_full_run_with_fake_api(tmp_path, monkeypatch):
               abstract="We measured...", doi="10.1/a"),
         Paper(title="Unrelated", authors=["J. Smith"], year=2020),
     ])
-    monkeypatch.setattr(agent, "SEARCHERS", sources.SEARCHERS)
     requests_seen = []
     script = iter(SCRIPT)
 
@@ -76,9 +76,10 @@ def test_full_run_with_fake_api(tmp_path, monkeypatch):
                                  http_client=anthropic.DefaultHttpxClient(
                                      transport=httpx2.MockTransport(handler)))
     cfg = ReviewConfig(topic="Water retention of lateritic soils", out_dir=tmp_path)
-    lib = Library(tmp_path, topic=cfg.topic)
+    box = ToolBox(tmp_path, topic=cfg.topic, log=lambda *_: None)
 
-    summary = run_research(client, cfg, lib, http=None, log=lambda *_: None)
+    summary = run_research(client, cfg, box, log=lambda *_: None)
+    lib = Library.load(tmp_path)
     assert summary == "Search done; one relevant study."
     assert lib.counts() == {"candidate": 0, "included": 1, "excluded": 1, "total": 2}
     assert lib.searches[0]["new"] == 2

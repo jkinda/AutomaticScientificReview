@@ -1,8 +1,9 @@
 """The review agent: a Claude tool-use loop for research, then a synthesis call.
 
 Phase 1 (research): Claude drives the search with the tools defined in
-:func:`build_tools` — searching databases, screening papers, reading full texts
-and recording evidence into the :class:`Library`.
+:func:`build_tools` (thin wrappers over :class:`scireview.toolbox.ToolBox`) —
+searching databases, screening papers, reading full texts and recording
+evidence into the review's library.
 
 Phase 2 (synthesis): one streaming call turns the recorded evidence into a
 review. Citations are checked against the library and the reference list is
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -20,11 +22,9 @@ from typing import Any, Callable
 import anthropic
 from anthropic import beta_tool
 
-from .fulltext import download_pdf, extract_text
-from .http import HttpClient
 from .library import Library, format_reference
 from .prompts import RESEARCH_SYSTEM, SYNTHESIS_SYSTEM
-from .sources import SEARCHERS, SOURCES
+from .toolbox import ToolBox, ToolError
 
 MODEL = "claude-opus-5-5"
 # On a safety-classifier decline, the API re-runs the request on a fallback model.
@@ -32,7 +32,6 @@ FALLBACK_BETA = "server-side-fallback-2026-07-01"
 # Clears old tool results (long full-text pages) from the context as it grows;
 # the agent keeps what matters by writing it to the library with record_evidence.
 CONTEXT_BETA = "context-management-2025-06-27"
-READ_CHUNK = 15_000
 CITATION_RE = re.compile(r"\[(@[^\]]+)\]")
 
 
@@ -52,10 +51,16 @@ class ReviewConfig:
 
 # ------------------------------------------------------------------------------ tools
 
-def build_tools(lib: Library, http: HttpClient, cfg: ReviewConfig,
-                log: Callable[[str], None] = print) -> list:
-    """Create the tool functions, bound to this review's library."""
-    fulltext_cache: dict[str, str] = {}
+def _call(fn: Callable[..., dict[str, Any]], *args, **kwargs) -> str:
+    """Run a ToolBox operation and return JSON; errors go back to the model as data."""
+    try:
+        return json.dumps(fn(*args, **kwargs), ensure_ascii=False)
+    except ToolError as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+
+def build_tools(box: ToolBox) -> list:
+    """Expose the ToolBox operations as Claude tools."""
 
     @beta_tool
     def search_literature(query: str, source: str = "openalex", limit: int = 20) -> str:
@@ -70,40 +75,16 @@ def build_tools(lib: Library, http: HttpClient, cfg: ReviewConfig,
             source: One of "openalex", "semantic_scholar", "crossref", "arxiv".
             limit: Number of results to return, 1-50.
         """
-        if source not in SEARCHERS:
-            return json.dumps({"error": f"source must be one of {list(SOURCES)}"})
-        limit = max(1, min(int(limit), 50))
-        try:
-            papers = SEARCHERS[source](http, query, limit, cfg.year_from, cfg.year_to)
-        except Exception as exc:  # network/API errors go back to the model, not up the stack
-            lib.log_search(source, query, 0, 0, error=str(exc)[:200])
-            lib.save()
-            return json.dumps({"error": f"{source} search failed: {exc}"[:500]})
-        results, n_new = [], 0
-        for p in papers:
-            key, is_new = lib.add(p)
-            n_new += is_new
-            entry = lib.get(key)
-            results.append(entry.paper.short() | {"status": entry.status, "new": is_new})
-        lib.log_search(source, query, len(papers), n_new)
-        lib.save()
-        log(f"  search[{source}] {query!r}: {len(papers)} results, {n_new} new")
-        return json.dumps({"results": results, "library": lib.counts()}, ensure_ascii=False)
+        return _call(box.search, query, source, limit)
 
     @beta_tool
     def get_paper(key: str) -> str:
-        """Get the full metadata and complete abstract of a paper in the library.
+        """Get the full metadata, complete abstract and recorded evidence of a paper.
 
         Args:
             key: The paper key returned by search_literature, e.g. "Zhang2018".
         """
-        try:
-            e = lib.get(key)
-        except KeyError as exc:
-            return json.dumps({"error": str(exc)})
-        return json.dumps(e.paper.to_dict() | {"status": e.status, "reason": e.reason,
-                                               "evidence_records": len(e.evidence)},
-                          ensure_ascii=False)
+        return _call(box.get_paper, key)
 
     @beta_tool
     def screen_paper(key: str, decision: str, reason: str) -> str:
@@ -114,12 +95,7 @@ def build_tools(lib: Library, http: HttpClient, cfg: ReviewConfig,
             decision: "included" or "excluded".
             reason: One specific sentence explaining the decision against the inclusion criteria.
         """
-        try:
-            lib.screen(key, decision, reason)
-        except (KeyError, ValueError) as exc:
-            return json.dumps({"error": str(exc)})
-        log(f"  {decision:8} {key}: {reason[:90]}")
-        return json.dumps({"ok": True, "library": lib.counts()})
+        return _call(box.screen, key, decision, reason)
 
     @beta_tool
     def read_full_text(key: str, start_char: int = 0) -> str:
@@ -133,36 +109,7 @@ def build_tools(lib: Library, http: HttpClient, cfg: ReviewConfig,
             key: The paper key.
             start_char: Character offset to start reading from.
         """
-        try:
-            e = lib.get(key)
-        except KeyError as exc:
-            return json.dumps({"error": str(exc)})
-        if key not in fulltext_cache:
-            txt_path = lib.out_dir / "fulltext" / f"{key}.txt"
-            if txt_path.exists():
-                fulltext_cache[key] = txt_path.read_text(encoding="utf-8")
-            elif not e.paper.pdf_url:
-                return json.dumps({"error": "No open-access PDF known for this paper."})
-            else:
-                try:
-                    pdf = download_pdf(http, e.paper.pdf_url,
-                                       lib.out_dir / "pdfs" / f"{key}.pdf")
-                    text = extract_text(pdf)
-                except Exception as exc:  # FullTextError, HTTP errors, malformed PDFs
-                    e.fulltext_note = f"full text unavailable: {exc}"[:300]
-                    lib.save()
-                    return json.dumps({"error": e.fulltext_note})
-                txt_path.parent.mkdir(parents=True, exist_ok=True)
-                txt_path.write_text(text, encoding="utf-8")
-                fulltext_cache[key] = text
-                log(f"  read     {key}: {len(text):,} chars of full text")
-        text = fulltext_cache[key]
-        start = max(0, int(start_char))
-        chunk = text[start:start + READ_CHUNK]
-        end = start + len(chunk)
-        return json.dumps({"key": key, "total_chars": len(text), "start_char": start,
-                           "next_start_char": end if end < len(text) else None,
-                           "text": chunk}, ensure_ascii=False)
+        return _call(box.read, key, start_char)
 
     @beta_tool
     def record_evidence(key: str, study_summary: str, methods: str, key_results: str,
@@ -177,15 +124,8 @@ def build_tools(lib: Library, http: HttpClient, cfg: ReviewConfig,
             limitations: Limitations stated by the authors or evident from the method.
             based_on: "full_text" or "abstract" — what you actually read.
         """
-        evidence = {"study_summary": study_summary, "methods": methods,
-                    "key_results": key_results, "limitations": limitations,
-                    "based_on": based_on if based_on in ("full_text", "abstract") else "abstract"}
-        try:
-            lib.add_evidence(key, evidence)
-        except (KeyError, ValueError) as exc:
-            return json.dumps({"error": str(exc)})
-        log(f"  evidence {key} ({evidence['based_on']})")
-        return json.dumps({"ok": True, "library": lib.counts()})
+        return _call(box.record_evidence, key, study_summary, methods, key_results,
+                     limitations, based_on)
 
     @beta_tool
     def list_library(status: str = "included") -> str:
@@ -194,12 +134,7 @@ def build_tools(lib: Library, http: HttpClient, cfg: ReviewConfig,
         Args:
             status: "candidate", "included" or "excluded".
         """
-        rows = [{"key": e.paper.key, "title": e.paper.title, "year": e.paper.year,
-                 "evidence_records": len(e.evidence),
-                 "full_text_problem": e.fulltext_note or None}
-                for e in lib.with_status(status)]
-        return json.dumps({"status": status, "papers": rows, "counts": lib.counts()},
-                          ensure_ascii=False)
+        return _call(box.list, status)
 
     return [search_literature, get_paper, screen_paper, read_full_text,
             record_evidence, list_library]
@@ -221,15 +156,17 @@ def _research_brief(cfg: ReviewConfig, lib: Library) -> str:
             f"{resume}")
 
 
-def run_research(client: anthropic.Anthropic, cfg: ReviewConfig, lib: Library,
-                 http: HttpClient, log: Callable[[str], None] = print) -> str:
+def run_research(client: anthropic.Anthropic, cfg: ReviewConfig, box: ToolBox,
+                 log: Callable[[str], None] = print) -> str:
+    with box.library(write=False) as lib:
+        brief = _research_brief(cfg, lib)
     runner = client.beta.messages.tool_runner(
         model=cfg.model,
         max_tokens=16000,
         max_iterations=cfg.max_iterations,
         system=RESEARCH_SYSTEM,
-        tools=build_tools(lib, http, cfg, log),
-        messages=[{"role": "user", "content": _research_brief(cfg, lib)}],
+        tools=build_tools(box),
+        messages=[{"role": "user", "content": brief}],
         output_config={"effort": cfg.effort},
         cache_control={"type": "ephemeral"},
         context_management={"edits": [{"type": "clear_tool_uses_20250919"}]},
@@ -298,8 +235,12 @@ def check_citations(review: str, lib: Library) -> tuple[list[str], list[str]]:
     return cited, [k for k in cited if k not in included]
 
 
-def finalize(review: str, lib: Library) -> dict[str, Any]:
-    """Append metadata-built references, flag bad citations and write all outputs."""
+def finalize(review: str, lib: Library, export_dir: Path | None = None) -> dict[str, Any]:
+    """Append metadata-built references, flag bad citations and write all outputs.
+
+    Outputs go to the library's directory, and are also copied to ``export_dir``
+    when given (the hosted agent exports to /mnt/session/outputs).
+    """
     cited, unknown = check_citations(review, lib)
     refs = [k for k in cited if k not in unknown]
     out = review.rstrip() + "\n\n## References\n\n"
@@ -312,6 +253,11 @@ def finalize(review: str, lib: Library) -> dict[str, Any]:
     lib.write_bibtex(d / "references.bib", refs)
     lib.write_csv(d / "papers.csv")
     lib.save()
+    if export_dir is not None:
+        export_dir = Path(export_dir)
+        export_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("review.md", "references.bib", "papers.csv", "state.json"):
+            shutil.copyfile(d / name, export_dir / name)
     return {"cited": len(refs), "unknown_citations": unknown, "counts": lib.counts(),
             "uncited_included": [e.paper.key for e in lib.with_status("included")
                                  if e.paper.key not in refs]}

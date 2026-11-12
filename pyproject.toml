@@ -16,10 +16,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "pyyaml>=6"]
 
 [project.scripts]
 scireview = "scireview.cli:main"
+scireview-hosted = "scireview.hosted:main"
 
 [tool.setuptools]
 packages = ["scireview"]
