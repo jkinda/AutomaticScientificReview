@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Virtual environments — never commit these
+venv/
+.venv/
+env/
+
+# Review outputs (PDFs, extracted text, state). Commit a review deliberately if you want it.
+reviews/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Secrets
+.env
